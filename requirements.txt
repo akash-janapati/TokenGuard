@@ -1,8 +1,6 @@
-# Core engine is stdlib-only. These are optional enhancements.
+# Everything needed to run TokenGuard from the repo root: pip install -r requirements.txt
+# The gateway's dependencies live in localpilot/requirements.txt.
+-r localpilot/requirements.txt
 
-# Accurate token counting (falls back to chars/4 heuristic if absent)
-tiktoken>=0.5.0
-
-# HTTP service exposing POST /context for Person 1's orchestrator
-fastapi>=0.110.0
-uvicorn>=0.27.0
+# Tests (python -m pytest tests)
+pytest>=7.0             # tested 8.4.2
