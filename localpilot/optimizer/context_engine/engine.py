@@ -137,11 +137,22 @@ class ContextEngine:
                 f.rel_path
                 for f in sorted(files, key=lambda f: (-f.mtime, f.rel_path))[: cfg.top_k]
             ]
-            items = [
-                (self._to_public(0.0, "fallback: recent", c), c.content)
-                for c in chunks
-                if c.file in set(recent)
-            ]
+            items = []
+            last_end: dict = {}
+            for c in chunks:
+                if c.file not in set(recent):
+                    continue
+                # Window chunks overlap by cfg.window_overlap lines; drop the repeated prefix.
+                prev = last_end.get(c.file, 0)
+                if c.end_line <= prev:
+                    continue
+                content = c.content
+                public = self._to_public(0.0, "fallback: recent", c)
+                if c.start_line <= prev:
+                    content = "\n".join(content.split("\n")[prev - c.start_line + 1:])
+                    public.start_line = prev + 1
+                last_end[c.file] = c.end_line
+                items.append((public, content))
             return items, 0
 
         by_file: dict = {}
@@ -254,17 +265,40 @@ class ContextEngine:
             cost = counter.count(c.content)
             deepen.append((s / max(1, cost), s, r, c, cost))
         deepen.sort(key=lambda x: (-x[0], x[3].file, x[3].start_line))
-        for _dens, s, r, c, cost in deepen:
+
+        def without_overlap(c):
+            """Window chunks overlap by cfg.window_overlap lines: drop lines already sent.
+            Returns (start_line, end_line, content), or None if nothing new remains."""
+            lines = c.content.split("\n")
+            taken = [(s0, e0) for (f0, s0, e0) in used if f0 == c.file]
+            if not any(c.start_line <= e0 and s0 <= c.end_line for s0, e0 in taken):
+                return c.start_line, c.end_line, c.content
+            if len(lines) != c.end_line - c.start_line + 1:
+                return None  # can't map lines reliably; skip rather than duplicate
+            keep = [i for i in range(len(lines))
+                    if not any(s0 <= c.start_line + i <= e0 for s0, e0 in taken)]
+            if not keep or keep[-1] - keep[0] + 1 != len(keep):
+                return None  # fully covered, or the new lines aren't contiguous
+            return c.start_line + keep[0], c.start_line + keep[-1], "\n".join(lines[keep[0]:keep[-1] + 1])
+
+        for _dens, s, r, c, _cost in deepen:
             if remaining < min_keep:
                 break
             if per_file.get(c.file, 0) >= cfg.max_chunks_per_file:
                 continue
+            trimmed = without_overlap(c)
+            if trimmed is None:
+                continue
+            start_line, end_line, content = trimmed
+            cost = counter.count(content)
             if cost > remaining:
                 continue
             remaining -= cost
             per_file[c.file] = per_file.get(c.file, 0) + 1
-            used.add((c.file, c.start_line, c.end_line))
-            items.append((self._to_public(s, r, c), c.content))
+            used.add((c.file, start_line, end_line))
+            public = self._to_public(s, r, c)
+            public.start_line, public.end_line = start_line, end_line
+            items.append((public, content))
 
         # Phase 4 — structural neighbors with no lexical hit: header if it fits.
         for f in structural_neighbors:

@@ -104,6 +104,7 @@ def render_meta(meta, idx):
     with st.expander("Why this route?"):
         a = meta["analysis"]
         st.write(f"Complexity score **{a['complexity_score']}** → `{a['decision']}`")
+        st.write(f"Repo searched: `{a.get('repo_path') or 'none'}` · " + "; ".join(a.get("context_sources") or []))
         st.write(a["factors"])
         for reason in a["reasons"]:
             st.write(f"- {reason}")

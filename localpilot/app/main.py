@@ -40,6 +40,8 @@ class ChatResponse(BaseModel):
     secrets_redacted: int
     redaction_details: List[str]
     context_optimizer: str
+    repo_path: Optional[str]
+    context_sources: List[str]
     latency_ms: int
     local_latency_ms: Optional[int]
     cloud_latency_ms: Optional[int]

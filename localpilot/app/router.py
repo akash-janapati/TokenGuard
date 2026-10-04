@@ -5,7 +5,8 @@ from typing import Any, Dict, List, Optional
 
 from . import config
 from .analyzer import analyze
-from .context import optimize_context, redact_text, repo_stats
+from .contracts import ContextResult
+from .context import ResolvedRequest, optimize_context, redact_text, repo_stats, resolve_request
 from .llm import LLMResult, call_cloud, call_local
 from .tokens import count_tokens
 
@@ -20,13 +21,26 @@ def decide(score: float) -> str:
     return "local_first"
 
 
+def compress(req: ResolvedRequest, trace: Optional[List[str]] = None) -> ContextResult:
+    """Run the context optimizer (selection + compression + redaction) for this request's repo."""
+    ctx = optimize_context(req.prompt, req.repo_path, code=req.code, token_budget=config.CLOUD_CONTEXT_TOKEN_BUDGET)
+    if trace is not None:
+        trace.append(
+            f"context compression [{ctx.optimizer}] on {req.repo_path or 'no repo'}: "
+            f"{ctx.original_tokens} -> {ctx.optimized_tokens} tokens, {len(ctx.files_selected)} file(s), "
+            f"{ctx.secrets_redacted} secret(s) masked"
+        )
+    return ctx
+
+
 def preview(prompt: str, repo_path: Optional[str] = None, code: str = "") -> Dict[str, Any]:
     """Dry run: the routing decision and token estimates, without calling any model.
     Lets a UI ask the user for consent before anything is sent to the cloud."""
-    repo_tokens, num_files = repo_stats(repo_path)
-    analysis = analyze(prompt, code=code, repo_context_tokens=repo_tokens, num_repo_files=num_files)
-    ctx = optimize_context(prompt, repo_path, code=code, token_budget=config.CLOUD_CONTEXT_TOKEN_BUDGET)
-    prompt_tokens = count_tokens(prompt)
+    req = resolve_request(prompt, repo_path, code)
+    repo_tokens, num_files = repo_stats(req.repo_path)
+    analysis = analyze(req.prompt, code=req.code, repo_context_tokens=repo_tokens, num_repo_files=num_files)
+    ctx = compress(req)
+    prompt_tokens = count_tokens(req.prompt)
     return {
         "decision": decide(analysis.score),
         "complexity_score": analysis.score,
@@ -38,6 +52,8 @@ def preview(prompt: str, repo_path: Optional[str] = None, code: str = "") -> Dic
         "files_selected": ctx.files_selected,
         "secrets_redacted": ctx.secrets_redacted,
         "context_optimizer": ctx.optimizer,
+        "repo_path": req.repo_path,
+        "context_sources": req.sources,
         "min_local_confidence": config.MIN_LOCAL_CONFIDENCE,
         "cloud_provider": config.CLOUD_PROVIDER,
     }
@@ -47,15 +63,15 @@ async def handle(prompt: str, repo_path: Optional[str] = None, code: str = "", f
     start = time.perf_counter()
     trace: List[str] = []
 
-    repo_tokens, num_files = repo_stats(repo_path)
-    analysis = analyze(prompt, code=code, repo_context_tokens=repo_tokens, num_repo_files=num_files)
+    req = resolve_request(prompt, repo_path, code)
+    prompt = req.prompt
+    trace.append("context sources: " + ("; ".join(req.sources) or "prompt only"))
+    repo_tokens, num_files = repo_stats(req.repo_path)
+    analysis = analyze(prompt, code=req.code, repo_context_tokens=repo_tokens, num_repo_files=num_files)
     decision = decide(analysis.score) if force_route == "auto" else force_route
     trace.append(f"score={analysis.score} -> {decision}")
 
-    # Cloud-only baseline: what a normal assistant would send (prompt + all code/repo)
-    ctx = optimize_context(prompt, repo_path, code=code, token_budget=config.CLOUD_CONTEXT_TOKEN_BUDGET)
-    baseline_tokens = count_tokens(prompt) + ctx.original_tokens
-
+    ctx: Optional[ContextResult] = None
     local: Optional[LLMResult] = None
     cloud: Optional[LLMResult] = None
     escalated = False
@@ -64,6 +80,7 @@ async def handle(prompt: str, repo_path: Optional[str] = None, code: str = "", f
     if decision in ("local", "local_first"):
         try:
             # Local model is private, so it can see the same optimized context
+            ctx = compress(req, trace)
             local = await call_local(prompt, ctx.context)
             trace.append(f"local confidence={local.confidence} needs_cloud={local.needs_cloud}")
             if local.confidence < config.MIN_LOCAL_CONFIDENCE:
@@ -81,12 +98,19 @@ async def handle(prompt: str, repo_path: Optional[str] = None, code: str = "", f
     if decision == "cloud" or escalated:
         # Only the cloud path needs redaction: local never leaves the machine
         cloud_prompt, prompt_secrets = redact_text(prompt)
+        # Every global call goes through the optimizer: only the selected, compressed, redacted
+        # context leaves the machine (reused if the local attempt already built it for this request)
+        if ctx is None:
+            ctx = compress(req, trace)
         cloud = await call_cloud(cloud_prompt, ctx.context)
 
     final = cloud or local
     if final is None:
         raise RuntimeError(escalation_reason or "no model produced an answer")
 
+    assert ctx is not None  # whichever model answered ran compress() first
+    # Cloud-only baseline: what a normal assistant would send (prompt + all code/repo)
+    baseline_tokens = count_tokens(prompt) + ctx.original_tokens
     sent_tokens = cloud.input_tokens if cloud else 0
     return {
         "answer": final.answer,
@@ -106,6 +130,8 @@ async def handle(prompt: str, repo_path: Optional[str] = None, code: str = "", f
         "secrets_redacted": (ctx.secrets_redacted + prompt_secrets) if cloud else 0,
         "redaction_details": ctx.redaction_details if cloud else [],
         "context_optimizer": ctx.optimizer,
+        "repo_path": req.repo_path,
+        "context_sources": req.sources,
         "latency_ms": int((time.perf_counter() - start) * 1000),
         "local_latency_ms": local.latency_ms if local else None,
         "cloud_latency_ms": cloud.latency_ms if cloud else None,

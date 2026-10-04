@@ -11,6 +11,7 @@ router never breaks because of the optimizer.
 import logging
 import os
 import re
+from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
 from .contracts import ContextResult
@@ -115,3 +116,83 @@ def redact_text(text: str) -> Tuple[str, int]:
         except Exception:
             log.exception("Person 2 redact_text failed; sending prompt unredacted")
     return text, 0
+
+
+# ---------- Request resolution: which repo / code does this prompt refer to? ----------
+
+_ABS_PATH = re.compile(r"(?:~|/)[^\s'\"`<>|]+")
+
+
+@dataclass
+class ResolvedRequest:
+    prompt: str                 # prompt with any typed paths removed (their content is attached instead)
+    repo_path: Optional[str]    # repo the optimizer searches
+    code: str                   # editor selection + any files named in the prompt
+    sources: List[str] = field(default_factory=list)  # human-readable: where the context came from
+
+
+_ROOT_MARKERS = (".git", "package.json", "pyproject.toml", "setup.py", "requirements.txt", "go.mod", "Cargo.toml", "pom.xml")
+
+
+def _project_root(path: str) -> Optional[str]:
+    """Nearest enclosing folder that looks like a project root (git repo or package manifest)."""
+    d = path if os.path.isdir(path) else os.path.dirname(path)
+    while True:
+        if any(os.path.exists(os.path.join(d, m)) for m in _ROOT_MARKERS):
+            return d
+        parent = os.path.dirname(d)
+        if parent == d:
+            return None
+        d = parent
+
+
+def _paths_in_prompt(prompt: str) -> List[Tuple[str, str]]:
+    """(text as typed, absolute path) for every existing file/folder path in the prompt.
+    A whole line is tried first so paths containing spaces work when pasted on their own line."""
+    found: List[Tuple[str, str]] = []
+    for line in prompt.splitlines():
+        whole = line.strip().strip("'\"")
+        if whole.startswith(("/", "~")) and os.path.exists(os.path.expanduser(whole)):
+            found.append((line.strip(), os.path.realpath(os.path.expanduser(whole))))
+            continue
+        for m in _ABS_PATH.finditer(line):
+            text = m.group(0).rstrip(".,;:)")
+            path = os.path.expanduser(text)
+            if os.path.exists(path):
+                found.append((text, os.path.realpath(path)))
+    return found
+
+
+def resolve_request(prompt: str, repo_path: Optional[str], code: str = "") -> ResolvedRequest:
+    """A path typed in the prompt wins over the UI's repo_path: a folder becomes the repo to
+    search, a file is attached as code and its repo is searched."""
+    sources: List[str] = []
+    if code.strip():
+        sources.append("editor selection")
+    prompt_dir: Optional[str] = None
+    prompt_file_repo: Optional[str] = None
+    for text, path in _paths_in_prompt(prompt):
+        prompt = prompt.replace(text, " ")
+        if os.path.isdir(path):
+            prompt_dir = prompt_dir or path
+        elif os.path.getsize(path) <= MAX_FILE_BYTES:
+            try:
+                with open(path, encoding="utf-8") as f:
+                    code = f"{code}\n\n# File: {os.path.basename(path)}\n{f.read()}".strip()
+            except (UnicodeDecodeError, OSError):
+                continue
+            if repo_path and path.startswith(os.path.realpath(repo_path) + os.sep):
+                inferred = repo_path  # file is inside the open workspace: search the workspace
+            else:
+                inferred = _project_root(path) or os.path.dirname(path)
+            prompt_file_repo = prompt_file_repo or inferred
+            sources.append(f"file from prompt: {path}")
+
+    cleaned = re.sub(r"[ \t]+", " ", prompt).strip()
+    resolved_repo = prompt_dir or prompt_file_repo or repo_path
+    if resolved_repo and os.path.isdir(resolved_repo):
+        origin = "from prompt" if resolved_repo != repo_path else "workspace"
+        sources.insert(0, f"repo ({origin}): {resolved_repo}")
+    else:
+        resolved_repo = None
+    return ResolvedRequest(prompt=cleaned or prompt.strip(), repo_path=resolved_repo, code=code, sources=sources)

@@ -11,6 +11,8 @@ Person 1's counter, and redacts secrets.
 from __future__ import annotations
 
 import os
+import re
+from collections import Counter
 from typing import List, Optional, Tuple
 
 from app.contracts import ContextResult
@@ -24,6 +26,27 @@ from .context_engine.walker import walk_repo
 OPTIMIZER_NAME = "person2-v1"
 
 _ENGINE = ContextEngine()
+
+_IDENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]{3,}")
+_CODE_NOISE = {
+    "self", "this", "return", "import", "from", "const", "function", "class", "def", "async",
+    "await", "export", "default", "true", "false", "none", "null", "undefined", "string",
+    "number", "boolean", "void", "public", "private", "static", "else", "elif", "while",
+    "with", "lambda", "yield", "pass", "break", "continue", "throw", "catch", "finally",
+    "print", "console", "file", "type", "interface", "extends", "implements", "require",
+}
+_MAX_CODE_TERMS = 25
+
+
+def _query_from(prompt: str, code: str) -> str:
+    """The engine ranks files lexically, so a vague prompt ("explain this") has no terms and
+    would fall back to the most recently modified files. Add the most frequent identifiers of
+    the attached code so the files related to that code are selected instead."""
+    if not code.strip():
+        return prompt
+    counts = Counter(t for t in _IDENT.findall(code) if t.lower() not in _CODE_NOISE)
+    terms = [t for t, _ in counts.most_common(_MAX_CODE_TERMS)]
+    return f"{prompt} {' '.join(terms)}".strip()
 
 
 def _truncate_to_budget(text: str, budget: int) -> str:
@@ -74,7 +97,7 @@ def optimize_context(
             try:
                 result = _ENGINE.build(
                     ContextRequest(
-                        query=prompt or "",
+                        query=_query_from(prompt or "", code),
                         repo_path=repo_path,
                         top_k=8,
                         max_tokens=repo_budget,

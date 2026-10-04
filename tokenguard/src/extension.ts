@@ -86,14 +86,17 @@ function buildRequest(prompt: string): { req: ChatRequest; contextInfo: string }
         const lines = editor.selection.end.line - editor.selection.start.line + 1;
         info.push(`${lines} selected line(s) from ${vscode.workspace.asRelativePath(editor.document.uri)}`);
     }
-    const folder = vscode.workspace.workspaceFolders?.[0];
+    // Search the workspace folder that holds the active file (multi-root safe); a path typed
+    // in the prompt overrides this on the backend.
+    const folder = (editor && vscode.workspace.getWorkspaceFolder(editor.document.uri))
+        || vscode.workspace.workspaceFolders?.[0];
     const repoPath = folder && folder.uri.scheme === 'file' ? folder.uri.fsPath : null;
     if (folder && repoPath) {
         info.push(`workspace "${folder.name}"`);
     }
     return {
         req: { prompt, code, repo_path: repoPath },
-        contextInfo: info.length ? info.join(' + ') : 'no code context (open a folder or select code)'
+        contextInfo: info.length ? info.join(' + ') : 'no code context (open a folder, select code, or paste a path in the prompt)'
     };
 }
 
@@ -352,13 +355,14 @@ class LocalPilotViewProvider implements vscode.WebviewViewProvider {
                         '<div class="metrics"><b>Complexity:</b> ' + esc(a.complexity_score) +
                         ' · <b>Task:</b> ' + esc(a.task_type) +
                         ' · <b>Optimizer:</b> ' + esc(a.context_optimizer) + '</div>' +
-                        '<div class="muted">Context: ' + esc(contextInfo) + '</div>' +
+                        '<div class="muted">Repo searched: ' + (a.repo_path ? '<code>' + esc(a.repo_path) + '</code>' : 'none') +
+                        ' · from ' + esc((a.context_sources || []).join('; ') || contextInfo) + '</div>' +
                         '<ul>' + reasons + '</ul>' +
                         '<div>Global would send ~<b>' + fmt(a.estimated_cloud_tokens) + '</b> tokens instead of ' +
                         fmt(a.original_tokens) + ' for the full context' +
                         (a.secrets_redacted ? ', with <b>' + a.secrets_redacted + '</b> secret(s) masked' : '') +
                         '. Local sends nothing off your machine.</div>' +
-                        (files ? '<details><summary>Files the global LLM would see</summary>' + files + '</details>' : '') +
+                        (files ? '<details open><summary>Files selected by context compression (' + a.files_selected.length + ')</summary>' + files + '</details>' : '') +
                         '<div class="choices">' +
                             '<button data-route="local" data-id="' + id + '" class="' + (isCloud ? 'secondary' : '') + '">🖥️ Use local LLM</button>' +
                             '<button data-route="cloud" data-id="' + id + '" class="' + (isCloud ? '' : 'secondary') + '">☁️ Use global LLM' + (isCloud ? ' (recommended)' : '') + '</button>' +
@@ -389,7 +393,8 @@ class LocalPilotViewProvider implements vscode.WebviewViewProvider {
                         (r.escalated ? '<div class="warn">Escalated: ' + esc(r.escalation_reason) + '</div>' : '') +
                         (lowConf ? '<div class="warn">The local model wasn\\'t confident about this answer.</div>' : '') +
                         '<div class="answer">' + renderMarkdown(r.answer) + '</div>' +
-                        (!isLocal && files ? '<details><summary>Context sent</summary>' + files + '</details>' : '') +
+                        (!isLocal ? '<details' + (files ? ' open' : '') + '><summary>Context sent after compression (' + (r.files_selected || []).length + ' files)</summary>' +
+                            (r.repo_path ? '<div class="muted">from <code>' + esc(r.repo_path) + '</code></div>' : '') + (files || 'no repo files') + '</details>' : '') +
                         (trace ? '<details><summary>Pipeline trace</summary><ul>' + trace + '</ul></details>' : '') +
                         (isLocal ? '<div class="choices"><button data-route="cloud" data-id="' + id + '" class="' + (lowConf ? '' : 'secondary') + '">' +
                             (lowConf ? '☁️ Retry with global LLM' : 'Not satisfied? ☁️ Use global LLM') + '</button></div>' : '');
