@@ -1,10 +1,10 @@
-# LocalPilot.
+# TokenGuard
 
 > **A local-first AI gateway for coding assistants.**
 >
 > Use a small on-device model for simple coding tasks and intelligently send only the difficult tasks and relevant context to a cloud LLM — reducing token usage, cost, latency, and code exposure.
 
-LocalPilot is not another coding LLM. It is an **intelligent inference layer** that decides *where* and *how much* AI should be used.
+TokenGuard is not another coding LLM. It is an **intelligent inference layer** that decides *where* and *how much* AI should be used.
 
 ---
 
@@ -16,7 +16,7 @@ Cloud-only coding assistants send every request — and often a huge slice of yo
 - High latency for tasks a local model could handle instantly
 - Unnecessary code exposure to third parties
 
-LocalPilot routes each request to the cheapest, fastest, most private model that can actually answer it, and compresses context before anything leaves your machine.
+TokenGuard routes each request to the cheapest, fastest, most private model that can actually answer it, and compresses context before anything leaves your machine.
 
 ---
 
@@ -109,7 +109,7 @@ Instead of sending the whole repository to the cloud:
 10,000 lines → Cloud
 ```
 
-LocalPilot narrows the context first:
+TokenGuard narrows the context first:
 
 ```text
 Repository
@@ -214,10 +214,10 @@ CLOUD_LLM_MODEL=your-cloud-model
 
 ## The Demo: Before / After
 
-The same five requests, cloud-only vs LocalPilot:
+The same five requests, cloud-only vs TokenGuard:
 
 ```text
-                    Cloud-only       LocalPilot
+                    Cloud-only       TokenGuard
 ────────────────────────────────────────────────
 Simple regex          800 tokens       0 cloud
 Explain function     1,200 tokens       0 cloud
@@ -236,7 +236,7 @@ The before/after measurement is the centerpiece of the presentation.
 
 ## Positioning
 
-**LocalPilot is not a coding LLM. It is the inference layer that decides where your tokens go.**
+**TokenGuard is not a coding LLM. It is the inference layer that decides where your tokens go.**
 
 - Keep simple work on-device
 - Escalate only when necessary
