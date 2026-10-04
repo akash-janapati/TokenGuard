@@ -36,7 +36,7 @@ flowchart TD
     LC --> LA["Answer card: model, confidence, 0 cloud tokens<br/>button: Use global LLM (highlighted if confidence < 0.7)"]
     LA -- "Use global LLM" --> G["POST /chat force_route=cloud"]
     G --> CE["Context engine: walk → chunk → rank → expand → budget → redact<br/>≤ 3,000 tokens"]
-    CE --> CL["Cloud LLM (Anthropic / OpenAI-compatible / mock)"]
+    CE --> CL["Global LLM: DeepSeek deepseek-chat<br/>(falls back to the mock if the call fails)"]
     CL --> GA["Answer card: tokens sent vs full context, files sent, secrets masked, trace"]
 ```
 
@@ -50,7 +50,7 @@ flowchart TD
    - `cloud` (score > 0.65): the sidebar waits for the user to click **Use local LLM** or **Use global LLM (recommended)**.
 5. **Run the chosen route (`POST /chat` with `force_route`).**
    - **Local:** the context engine builds the context, Ollama answers as JSON `{answer, confidence, needs_cloud}`, and the confidence is adjusted (very short answers and hedges such as "I'm not sure" lower it). Nothing leaves the machine.
-   - **Global:** the context engine always runs right before the cloud call: it selects the relevant code, fits it into the token budget and masks secrets in both the code and the prompt. Only that slice is sent.
+   - **Global:** the context engine always runs right before the cloud call: it selects the relevant code, fits it into the token budget and masks secrets in both the code and the prompt. Only that slice is sent to DeepSeek (`deepseek-chat`). If that call fails, the mock answers instead and the card shows why.
 6. **Show the receipts.** The answer card shows the model, latency, confidence (local) or tokens sent / saved, files sent and secrets masked (global), plus a pipeline trace. A local answer always offers **Use global LLM**; it is highlighted when confidence is below 0.7. The header shows backend and Ollama status and the session's local/cloud counts and tokens saved (`GET /health`, `GET /stats`).
 
 ### Routing score
@@ -114,7 +114,7 @@ If the engine fails, the router falls back to a simpler keyword-based optimizer 
 
 - Python 3.9+
 - VS Code 1.82+, and Node.js 18+ to rebuild the extension (`tokenguard/out/` is committed)
-- Optional: an Anthropic or OpenAI-compatible API key. Without one, `CLOUD_PROVIDER=mock` returns a stand-in cloud answer so the whole pipeline still runs.
+- A DeepSeek API key for the global LLM (put it in `localpilot/.env`). Without one, or if the call fails, the gateway answers with a mock so the whole pipeline still runs, and the answer card says so.
 
 ### 1. Backend (gateway)
 
@@ -124,7 +124,7 @@ source localpilot/.venv/bin/activate
 pip install -r requirements.txt
 
 cd localpilot
-cp .env.example .env          # set CLOUD_PROVIDER and API keys here
+cp .env.example .env          # replace the DEEPSEEK_API_KEY placeholder with your key
 uvicorn app.main:app --reload --port 8000
 ```
 
@@ -155,7 +155,10 @@ python -m pytest tests                    # context engine tests
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `CLOUD_PROVIDER` | `mock` | `anthropic`, `openai` (any OpenAI-compatible API) or `mock` |
+| `CLOUD_PROVIDER` | `deepseek` | `deepseek`, `anthropic`, `openai` (any OpenAI-compatible API) or `mock` |
+| `CLOUD_FALLBACK_TO_MOCK` | `true` | If the global LLM call fails (missing key, network, API error), answer with the mock and show the reason |
+| `DEEPSEEK_API_KEY` | `your-deepseek-api-key` (placeholder) | Your DeepSeek key |
+| `DEEPSEEK_URL`, `DEEPSEEK_MODEL` | `https://api.deepseek.com/chat/completions`, `deepseek-chat` (DeepSeek-V3) | DeepSeek endpoint and model (output capped at 8,192 tokens) |
 | `ANTHROPIC_API_KEY`, `ANTHROPIC_MODEL` | – , `claude-sonnet-5-5` | Anthropic settings |
 | `OPENAI_API_KEY`, `OPENAI_BASE_URL`, `OPENAI_MODEL` | – , OpenAI, `gpt-4o-mini` | OpenAI-compatible settings (OpenAI, Groq, OpenRouter, …) |
 | `OLLAMA_URL`, `LOCAL_MODEL` | `http://localhost:11434`, `qwen2.5-coder:7b` | Local model |

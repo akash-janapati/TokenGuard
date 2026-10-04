@@ -23,8 +23,19 @@ LOCAL_MODEL = os.getenv("LOCAL_MODEL", "qwen2.5-coder:7b")
 LOCAL_TIMEOUT_S = float(os.getenv("LOCAL_TIMEOUT_S", "120"))
 LOCAL_NUM_CTX = int(os.getenv("LOCAL_NUM_CTX", "8192"))  # Ollama's default window silently truncates
 
-# Cloud LLM: "anthropic", "openai" (any OpenAI-compatible API: OpenAI, Groq, OpenRouter...), or "mock"
-CLOUD_PROVIDER = os.getenv("CLOUD_PROVIDER", "mock")
+# Cloud (global) LLM: "deepseek", "anthropic", "openai" (any OpenAI-compatible API), or "mock"
+CLOUD_PROVIDER = os.getenv("CLOUD_PROVIDER", "deepseek")
+# If the real cloud call fails (no key, network, API error), answer with the mock instead of erroring
+CLOUD_FALLBACK_TO_MOCK = os.getenv("CLOUD_FALLBACK_TO_MOCK", "true").lower() in ("1", "true", "yes")
+
+DEEPSEEK_URL = os.getenv("DEEPSEEK_URL", "https://api.deepseek.com/chat/completions")
+DEEPSEEK_API_KEY_ENV = "DEEPSEEK_API_KEY"
+DEEPSEEK_API_KEY_PLACEHOLDER = "your-deepseek-api-key"
+DEEPSEEK_API_KEY = os.getenv(DEEPSEEK_API_KEY_ENV, DEEPSEEK_API_KEY_PLACEHOLDER)
+DEEPSEEK_DEFAULT_MODEL = "deepseek-chat"  # DeepSeek-V3
+DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", DEEPSEEK_DEFAULT_MODEL)
+DEEPSEEK_MAX_TOKENS = 8192  # deepseek-chat's output cap; larger values are rejected
+
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-5-5")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")

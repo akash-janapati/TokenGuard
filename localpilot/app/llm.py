@@ -1,5 +1,6 @@
 """LLM clients: Ollama (local) and a pluggable cloud provider."""
 import json
+import logging
 import re
 import time
 from dataclasses import dataclass
@@ -8,6 +9,8 @@ from typing import Optional
 import httpx
 
 from . import config
+
+log = logging.getLogger("localpilot.llm")
 
 SYSTEM_PROMPT = "You are an expert coding assistant. Be concise and correct. Use markdown code blocks for code."
 
@@ -34,6 +37,7 @@ class LLMResult:
     output_tokens: int = 0
     confidence: Optional[float] = None
     needs_cloud: bool = False
+    fallback_reason: Optional[str] = None  # set when the real cloud call failed and the mock answered
 
 
 def _parse_local_json(raw: str):
@@ -126,17 +130,17 @@ async def _call_anthropic(user_content: str) -> LLMResult:
     )
 
 
-async def _call_openai_compatible(user_content: str) -> LLMResult:
-    if not config.OPENAI_API_KEY:
-        raise RuntimeError("OPENAI_API_KEY is not set")
+async def _call_openai_compatible(
+    user_content: str, url: str, api_key: str, model: str, max_tokens: int
+) -> LLMResult:
     start = time.perf_counter()
     async with httpx.AsyncClient(timeout=config.CLOUD_TIMEOUT_S) as client:
         resp = await client.post(
-            f"{config.OPENAI_BASE_URL}/chat/completions",
-            headers={"Authorization": f"Bearer {config.OPENAI_API_KEY}"},
+            url,
+            headers={"Authorization": f"Bearer {api_key}"},
             json={
-                "model": config.OPENAI_MODEL,
-                "max_tokens": config.CLOUD_MAX_TOKENS,
+                "model": model,
+                "max_tokens": max_tokens,
                 "messages": [
                     {"role": "system", "content": SYSTEM_PROMPT},
                     {"role": "user", "content": user_content},
@@ -148,7 +152,7 @@ async def _call_openai_compatible(user_content: str) -> LLMResult:
     usage = data.get("usage", {})
     return LLMResult(
         answer=data["choices"][0]["message"]["content"],
-        model=config.OPENAI_MODEL,
+        model=data.get("model", model),
         latency_ms=int((time.perf_counter() - start) * 1000),
         input_tokens=usage.get("prompt_tokens", 0),
         output_tokens=usage.get("completion_tokens", 0),
@@ -164,7 +168,7 @@ async def _call_mock(user_content: str) -> LLMResult:
     await asyncio.sleep(1.2)
     return LLMResult(
         answer=f"[MOCK CLOUD ANSWER] Received {count_tokens(user_content)} tokens of request + context. "
-        "Set CLOUD_PROVIDER=anthropic or openai to get a real answer.",
+        "Set DEEPSEEK_API_KEY in localpilot/.env (CLOUD_PROVIDER=deepseek) to get a real answer.",
         model="mock-cloud",
         latency_ms=1200,
         input_tokens=count_tokens(user_content),
@@ -172,11 +176,47 @@ async def _call_mock(user_content: str) -> LLMResult:
     )
 
 
+async def _call_deepseek(user_content: str) -> LLMResult:
+    key = config.DEEPSEEK_API_KEY
+    if not key or key == config.DEEPSEEK_API_KEY_PLACEHOLDER:
+        raise RuntimeError(f"{config.DEEPSEEK_API_KEY_ENV} is not set (still the placeholder)")
+    return await _call_openai_compatible(
+        user_content, config.DEEPSEEK_URL, key, config.DEEPSEEK_MODEL,
+        min(config.CLOUD_MAX_TOKENS, config.DEEPSEEK_MAX_TOKENS),
+    )
+
+
+async def _call_openai(user_content: str) -> LLMResult:
+    if not config.OPENAI_API_KEY:
+        raise RuntimeError("OPENAI_API_KEY is not set")
+    return await _call_openai_compatible(
+        user_content, f"{config.OPENAI_BASE_URL}/chat/completions", config.OPENAI_API_KEY,
+        config.OPENAI_MODEL, config.CLOUD_MAX_TOKENS,
+    )
+
+
+_PROVIDERS = {"deepseek": _call_deepseek, "anthropic": _call_anthropic, "openai": _call_openai}
+
+
+def _describe_error(e: Exception) -> str:
+    if isinstance(e, httpx.HTTPStatusError):
+        return f"HTTP {e.response.status_code}: {e.response.text[:200]}"
+    return f"{type(e).__name__}: {e}"[:300]
+
+
 async def call_cloud(prompt: str, context: str = "") -> LLMResult:
     user_content = f"{prompt}\n\n### Relevant code context\n{context}" if context else prompt
     provider = config.CLOUD_PROVIDER.lower()
-    if provider == "anthropic":
-        return await _call_anthropic(user_content)
-    if provider == "openai":
-        return await _call_openai_compatible(user_content)
-    return await _call_mock(user_content)
+    call = _PROVIDERS.get(provider)
+    if call is None:
+        return await _call_mock(user_content)
+    try:
+        return await call(user_content)
+    except Exception as e:
+        if not config.CLOUD_FALLBACK_TO_MOCK:
+            raise
+        reason = f"{provider} call failed ({_describe_error(e)}); answered with the mock"
+        log.warning(reason)
+        result = await _call_mock(user_content)
+        result.fallback_reason = reason
+        return result

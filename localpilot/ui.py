@@ -99,6 +99,8 @@ def render_meta(meta, idx):
         st.caption(f"☁️ **Global LLM** · `{meta['model']}` · {meta['latency_ms']} ms · "
                    f"sent {meta['sent_tokens']:,} of {meta['original_tokens']:,} tokens "
                    f"(saved {meta['tokens_saved']:,}) · {meta['secrets_redacted']} secrets masked")
+        if meta.get("cloud_fallback_reason"):
+            st.warning(f"Global LLM unavailable, showing the mock answer. {meta['cloud_fallback_reason']}")
         if meta.get("files_selected"):
             st.caption("Context sent: " + ", ".join(f"`{f}`" for f in meta["files_selected"]))
     with st.expander("Why this route?"):

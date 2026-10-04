@@ -391,6 +391,7 @@ class LocalPilotViewProvider implements vscode.WebviewViewProvider {
                             (isLocal ? '🟢 Local inference' : '🔵 Global (cloud) LLM') + '</span>' +
                         '<div class="metrics">' + metrics + '</div>' +
                         (r.escalated ? '<div class="warn">Escalated: ' + esc(r.escalation_reason) + '</div>' : '') +
+                        (r.cloud_fallback_reason ? '<div class="warn">⚠️ Global LLM unavailable, showing the mock answer. ' + esc(r.cloud_fallback_reason) + '</div>' : '') +
                         (lowConf ? '<div class="warn">The local model wasn\\'t confident about this answer.</div>' : '') +
                         '<div class="answer">' + renderMarkdown(r.answer) + '</div>' +
                         (!isLocal ? '<details' + (files ? ' open' : '') + '><summary>Context sent after compression (' + (r.files_selected || []).length + ' files)</summary>' +

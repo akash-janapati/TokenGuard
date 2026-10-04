@@ -103,6 +103,8 @@ async def handle(prompt: str, repo_path: Optional[str] = None, code: str = "", f
         if ctx is None:
             ctx = compress(req, trace)
         cloud = await call_cloud(cloud_prompt, ctx.context)
+        if cloud.fallback_reason:
+            trace.append(f"cloud fallback: {cloud.fallback_reason}")
 
     final = cloud or local
     if final is None:
@@ -135,5 +137,6 @@ async def handle(prompt: str, repo_path: Optional[str] = None, code: str = "", f
         "latency_ms": int((time.perf_counter() - start) * 1000),
         "local_latency_ms": local.latency_ms if local else None,
         "cloud_latency_ms": cloud.latency_ms if cloud else None,
+        "cloud_fallback_reason": cloud.fallback_reason if cloud else None,
         "trace": trace,
     }

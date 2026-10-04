@@ -45,6 +45,7 @@ class ChatResponse(BaseModel):
     latency_ms: int
     local_latency_ms: Optional[int]
     cloud_latency_ms: Optional[int]
+    cloud_fallback_reason: Optional[str] = None
     trace: List[str]
 
 
