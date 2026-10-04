@@ -145,50 +145,60 @@ Example result:
 
 ## Getting Started
 
-> Scaffolding is in progress. The steps below describe the intended setup.
+### Layout
+
+| Path | What |
+|---|---|
+| `localpilot/app/` | Orchestrator API (FastAPI): analyzer, router, local/cloud LLM clients |
+| `localpilot/optimizer/` | Context engine (relevant-file selection, compression, secret redaction) |
+| `localpilot/ui.py` | Optional Streamlit demo UI (same flow as the extension) |
+| `tokenguard/` | VS Code extension: the LocalPilot sidebar |
 
 ### Prerequisites
 
-- [Ollama](https://ollama.com/) running locally with a small coding model pulled, e.g.:
+- [Ollama](https://ollama.com/) running locally with the local model pulled (default `qwen2.5-coder:7b`, set `LOCAL_MODEL` to change):
 
   ```bash
-  ollama pull qwen2.5-coder:1.5b
+  ollama pull qwen2.5-coder:7b
   ```
 
-- Python 3.10+
-- Node.js 18+
-- API key for a cloud LLM provider
+- Python 3.9+
+- Node.js 18+ (only to rebuild the extension; `tokenguard/out/` is committed)
+- Optional: an Anthropic or OpenAI-compatible API key. Without one, `CLOUD_PROVIDER=mock` returns a stand-in cloud answer so the whole pipeline still runs.
 
-### Backend (Orchestrator)
+### 1. Backend (Orchestrator)
 
 ```bash
-cd orchestrator
+cd localpilot
 python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-uvicorn app.main:app --reload
+cp .env.example .env          # set CLOUD_PROVIDER / API keys here
+uvicorn app.main:app --reload --port 8000
 ```
 
-### VS Code Extension
+Check it: `curl localhost:8000/health`
+
+### 2. VS Code extension (sidebar)
 
 ```bash
-cd extension
+cd tokenguard
 npm install
 npm run compile
 ```
 
-Press `F5` in VS Code to launch the Extension Development Host.
+Open the `tokenguard/` folder in VS Code and press `F5`. In the Extension Development Host window, **open the project folder you want to ask about**
+(it is sent as `repo_path`), then click the LocalPilot icon in the activity bar.
 
-### Configuration
+The backend URL is the `tokenguard.apiUrl` setting (default `http://localhost:8000`).
 
-Create a `.env` file in the orchestrator directory:
+### How a prompt flows
 
-```env
-OLLAMA_BASE_URL=http://localhost:11434
-OLLAMA_MODEL=qwen2.5-coder:1.5b
-CLOUD_LLM_API_KEY=your-key-here
-CLOUD_LLM_MODEL=your-cloud-model
-```
+1. The sidebar sends the prompt, the editor selection (`code`) and the workspace folder (`repo_path`) to `POST /analyze`. No model is called yet.
+2. The sidebar shows the decision (`local` / `local_first` / `cloud`), the complexity score, the reasons, and how many tokens the global LLM would receive.
+3. Simple or medium tasks run on the **local LLM** automatically; the answer card offers **Use global LLM** if you're not satisfied (highlighted when local confidence is low).
+4. Complex tasks wait for you: **Use local LLM** or **Use global LLM (recommended)**.
+5. The choice calls `POST /chat` with `force_route` = `local` or `cloud`. The global route only gets the optimized, secret-redacted context.
 
 ---
 

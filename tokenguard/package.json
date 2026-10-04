@@ -4,7 +4,7 @@
   "description": "AI Router and token optimizer",
   "version": "0.0.1",
   "engines": {
-    "vscode": "^1.80.0"
+    "vscode": "^1.82.0"
   },
   "categories": [
     "Other"
@@ -41,6 +41,16 @@
           "icon": "./media/circuit-board.svg"
         }
       ]
+    },
+    "configuration": {
+      "title": "TokenGuard",
+      "properties": {
+        "tokenguard.apiUrl": {
+          "type": "string",
+          "default": "http://localhost:8000",
+          "description": "URL of the LocalPilot backend (localpilot/app/main.py)."
+        }
+      }
     }
   },
   "scripts": {

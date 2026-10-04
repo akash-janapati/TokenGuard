@@ -1,9 +1,27 @@
 import * as vscode from 'vscode';
 
+// Talks to the LocalPilot backend (localpilot/app/main.py):
+//   POST /analyze  -> routing decision only, no model called
+//   POST /chat     -> runs the pipeline; force_route picks the local or global (cloud) LLM
+//   GET  /health, /stats
+// The flow mirrors localpilot/ui.py: analyze first, run simple tasks locally,
+// and ask the user before a complex task goes to the global LLM.
+
+type Route = 'local' | 'cloud';
+
+interface ChatRequest {
+    prompt: string;
+    code: string;
+    repo_path: string | null;
+}
+
+const ANALYZE_TIMEOUT_MS = 60_000;
+const CHAT_TIMEOUT_MS = 600_000; // local 7B models can be slow on a cold start
+
 export function activate(context: vscode.ExtensionContext) {
     console.log('⚡ LocalPilot extension activated successfully!');
 
-    const provider = new LocalPilotViewProvider(context.extensionUri);
+    const provider = new LocalPilotViewProvider();
 
     // Register Webview Provider
     context.subscriptions.push(
@@ -25,63 +43,133 @@ export function activate(context: vscode.ExtensionContext) {
 
 export function deactivate() {}
 
+function apiUrl(): string {
+    const url = vscode.workspace.getConfiguration('tokenguard').get<string>('apiUrl') || 'http://localhost:8000';
+    return url.replace(/\/+$/, '');
+}
+
+async function api<T>(method: 'GET' | 'POST', path: string, body: unknown, timeoutMs: number): Promise<T> {
+    let resp: Response;
+    try {
+        resp = await fetch(`${apiUrl()}${path}`, {
+            method,
+            headers: { 'Content-Type': 'application/json' },
+            body: body === undefined ? undefined : JSON.stringify(body),
+            signal: AbortSignal.timeout(timeoutMs)
+        });
+    } catch (err) {
+        const reason = err instanceof Error && err.name === 'TimeoutError' ? 'timed out' : 'is not reachable';
+        throw new Error(
+            `LocalPilot backend at ${apiUrl()} ${reason}. Start it with: ` +
+            'cd localpilot && uvicorn app.main:app --reload --port 8000'
+        );
+    }
+    if (!resp.ok) {
+        let detail = await resp.text();
+        try {
+            detail = JSON.parse(detail).detail ?? detail;
+        } catch {
+            // plain-text error body
+        }
+        throw new Error(`Backend error ${resp.status}: ${detail}`);
+    }
+    return (await resp.json()) as T;
+}
+
+/** The prompt's context: current editor selection (if any) + the open workspace folder as the repo. */
+function buildRequest(prompt: string): { req: ChatRequest; contextInfo: string } {
+    const editor = vscode.window.activeTextEditor;
+    let code = '';
+    const info: string[] = [];
+    if (editor && !editor.selection.isEmpty) {
+        code = editor.document.getText(editor.selection);
+        const lines = editor.selection.end.line - editor.selection.start.line + 1;
+        info.push(`${lines} selected line(s) from ${vscode.workspace.asRelativePath(editor.document.uri)}`);
+    }
+    const folder = vscode.workspace.workspaceFolders?.[0];
+    const repoPath = folder && folder.uri.scheme === 'file' ? folder.uri.fsPath : null;
+    if (folder && repoPath) {
+        info.push(`workspace "${folder.name}"`);
+    }
+    return {
+        req: { prompt, code, repo_path: repoPath },
+        contextInfo: info.length ? info.join(' + ') : 'no code context (open a folder or select code)'
+    };
+}
+
 class LocalPilotViewProvider implements vscode.WebviewViewProvider {
-    constructor(private readonly _extensionUri: vscode.Uri) {}
+    private _view?: vscode.WebviewView;
 
     public resolveWebviewView(
         webviewView: vscode.WebviewView,
         _context: vscode.WebviewViewResolveContext,
         _token: vscode.CancellationToken
     ) {
+        this._view = webviewView;
         webviewView.webview.options = { enableScripts: true };
         webviewView.webview.html = this._getHtmlForWebview();
 
         webviewView.webview.onDidReceiveMessage(async (data) => {
-            if (data.type === 'sendPrompt') {
-                // Get active editor highlighted code (if any)
-                const editor = vscode.window.activeTextEditor;
-                let fullPrompt = data.prompt;
-                if (editor && !editor.selection.isEmpty) {
-                    const selectedCode = editor.document.getText(editor.selection);
-                    fullPrompt = `Selected Code:\n\`\`\`\n${selectedCode}\n\`\`\`\n\nTask: ${data.prompt}`;
-                }
-
-                try {
-                    // Call Person 1's Unified Endpoint
-                    const response = await fetch('http://localhost:8000/chat', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ prompt: fullPrompt })
-                    });
-                    const result = await response.json();
-                    webviewView.webview.postMessage({ type: 'addResponse', result });
-                } catch (err) {
-                    // MOCK FALLBACK (Guarantees demo works even if backend is offline)
-                    setTimeout(() => {
-                        const isLocal = data.prompt.length < 60;
-                        webviewView.webview.postMessage({
-                            type: 'addResponse',
-                            result: {
-                                routing: isLocal ? 'LOCAL' : 'CLOUD',
-                                confidence: isLocal ? 0.94 : 0.88,
-                                original_tokens: 12500,
-                                optimized_tokens: isLocal ? 0 : 3100,
-                                answer: isLocal
-                                    ? "[Local Model - Qwen/Ollama]: Executed locally on machine. Analyzed function scope without cloud data transmission."
-                                    : "[Cloud Escalation - Gemini/OpenAI]: Complexity threshold exceeded. Compressed workspace context from 12.5k tokens down to 3.1k tokens before sending."
-                            }
-                        });
-                    }, 400);
-                }
+            switch (data.type) {
+                case 'ready':
+                case 'refreshStatus':
+                    await this._postStatus();
+                    break;
+                case 'sendPrompt':
+                    await this._analyze(data.id, data.prompt);
+                    break;
+                case 'run':
+                    await this._run(data.id, data.req, data.route);
+                    break;
             }
         });
     }
 
+    private _post(message: unknown) {
+        void this._view?.webview.postMessage(message);
+    }
+
+    private async _postStatus() {
+        try {
+            const [health, stats] = await Promise.all([
+                api('GET', '/health', undefined, 5_000),
+                api('GET', '/stats', undefined, 5_000)
+            ]);
+            this._post({ type: 'status', online: true, health, stats, apiUrl: apiUrl() });
+        } catch (err) {
+            this._post({ type: 'status', online: false, error: (err as Error).message, apiUrl: apiUrl() });
+        }
+    }
+
+    /** Step 1: ask the backend where this prompt should go, without calling any model. */
+    private async _analyze(id: number, prompt: string) {
+        const { req, contextInfo } = buildRequest(prompt);
+        try {
+            const analysis = await api('POST', '/analyze', req, ANALYZE_TIMEOUT_MS);
+            this._post({ type: 'analysis', id, req, analysis, contextInfo });
+        } catch (err) {
+            this._post({ type: 'error', id, message: (err as Error).message });
+        }
+    }
+
+    /** Step 2: run the pipeline on the route the user (or the analysis) picked. */
+    private async _run(id: number, req: ChatRequest, route: Route) {
+        try {
+            const result = await api('POST', '/chat', { ...req, force_route: route }, CHAT_TIMEOUT_MS);
+            this._post({ type: 'result', id, route, result });
+        } catch (err) {
+            this._post({ type: 'error', id, message: (err as Error).message });
+        }
+        await this._postStatus();
+    }
+
     private _getHtmlForWebview(): string {
+        const nonce = getNonce();
         return `<!DOCTYPE html>
         <html lang="en">
         <head>
             <meta charset="UTF-8">
+            <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-${nonce}';">
             <style>
                 body {
                     font-family: var(--vscode-font-family);
@@ -113,6 +201,21 @@ class LocalPilotViewProvider implements vscode.WebviewViewProvider {
                     cursor: pointer;
                 }
                 button:hover { background: var(--vscode-button-hoverBackground); }
+                button:disabled { opacity: 0.5; cursor: default; }
+                button.secondary {
+                    background: var(--vscode-button-secondaryBackground);
+                    color: var(--vscode-button-secondaryForeground);
+                }
+                button.secondary:hover { background: var(--vscode-button-secondaryHoverBackground); }
+                .choices { display: flex; gap: 6px; margin-top: 8px; }
+                .status {
+                    font-size: 11px;
+                    padding: 6px 8px;
+                    border-radius: 4px;
+                    background: var(--vscode-editor-inactiveSelectionBackground);
+                }
+                .status .offline { color: var(--vscode-errorForeground); }
+                .stats { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 4px; opacity: 0.85; }
                 .chat-history { margin-top: 10px; display: flex; flex-direction: column; gap: 10px; }
                 .msg {
                     padding: 10px;
@@ -120,6 +223,7 @@ class LocalPilotViewProvider implements vscode.WebviewViewProvider {
                     border-radius: 6px;
                     font-size: 12px;
                 }
+                .msg.user { white-space: pre-wrap; }
                 .badge {
                     display: inline-block;
                     padding: 3px 8px;
@@ -131,6 +235,7 @@ class LocalPilotViewProvider implements vscode.WebviewViewProvider {
                 }
                 .local { background: #1b4332; color: #52b788; border: 1px solid #52b788; }
                 .cloud { background: #0d3b66; color: #4ea8de; border: 1px solid #4ea8de; }
+                .local_first { background: #4a3b00; color: #e9c46a; border: 1px solid #e9c46a; }
                 .metrics {
                     font-size: 11px;
                     opacity: 0.85;
@@ -138,60 +243,232 @@ class LocalPilotViewProvider implements vscode.WebviewViewProvider {
                     padding-bottom: 4px;
                     border-bottom: 1px dashed var(--vscode-widget-border);
                 }
-                .answer { margin: 0; white-space: pre-wrap; font-family: var(--vscode-editor-font-family); }
+                .warn { color: var(--vscode-editorWarning-foreground); margin: 6px 0; }
+                .error { color: var(--vscode-errorForeground); white-space: pre-wrap; }
+                .muted { opacity: 0.75; font-size: 11px; }
+                ul { margin: 4px 0; padding-left: 16px; }
+                details { margin-top: 6px; font-size: 11px; }
+                summary { cursor: pointer; opacity: 0.85; }
+                .answer { margin: 0; line-height: 1.45; }
+                .answer pre {
+                    background: var(--vscode-textCodeBlock-background);
+                    padding: 8px;
+                    border-radius: 4px;
+                    overflow-x: auto;
+                    white-space: pre;
+                }
+                .answer code { font-family: var(--vscode-editor-font-family); }
+                .answer p { margin: 0 0 6px 0; white-space: pre-wrap; }
+                .spinner { opacity: 0.8; font-style: italic; }
             </style>
         </head>
         <body>
             <div class="container">
-                <textarea id="prompt" placeholder="Ask LocalPilot about your repository..."></textarea>
-                <button onclick="send()">Send Request</button>
+                <div id="status" class="status">Connecting to LocalPilot backend…</div>
+                <textarea id="prompt" placeholder="Ask LocalPilot about your repository… (Enter to send, Shift+Enter for newline)"></textarea>
+                <button id="send">Send Request</button>
                 <div id="history" class="chat-history"></div>
             </div>
 
-            <script>
+            <script nonce="${nonce}">
                 const vscode = acquireVsCodeApi();
+                const history = document.getElementById('history');
+                const input = document.getElementById('prompt');
+                const sendBtn = document.getElementById('send');
+
+                let nextId = 1;
+                let busy = false;               // one request at a time, like the Streamlit UI
+                const turns = new Map();        // id -> { req, analysis, el, pendingEl }
+
+                function esc(s) {
+                    return String(s ?? '').replace(/[&<>"']/g, c => ({
+                        '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+                    })[c]);
+                }
+
+                // Minimal markdown: fenced code blocks, inline code, bold. Everything is escaped first.
+                function renderMarkdown(text) {
+                    const parts = String(text ?? '').split(/\`\`\`[\\w+-]*\\n?/);
+                    return parts.map((part, i) => {
+                        if (i % 2 === 1) return '<pre><code>' + esc(part.replace(/\\n$/, '')) + '</code></pre>';
+                        const html = esc(part)
+                            .replace(/\`([^\`\\n]+)\`/g, '<code>$1</code>')
+                            .replace(/\\*\\*([^*\\n]+)\\*\\*/g, '<b>$1</b>');
+                        return html.trim() ? '<p>' + html.trim() + '</p>' : '';
+                    }).join('');
+                }
+
+                function fmt(n) { return Number(n ?? 0).toLocaleString(); }
+
+                function setBusy(value) {
+                    busy = value;
+                    sendBtn.disabled = value;
+                    document.querySelectorAll('button[data-route]').forEach(b => { b.disabled = value || b.dataset.used === '1'; });
+                }
+
+                function addCard(html, cls = 'msg') {
+                    const div = document.createElement('div');
+                    div.className = cls;
+                    div.innerHTML = html;
+                    history.appendChild(div);
+                    div.scrollIntoView({ behavior: 'smooth', block: 'end' });
+                    return div;
+                }
 
                 function send() {
-                    const input = document.getElementById('prompt');
                     const prompt = input.value.trim();
-                    if (!prompt) return;
-
-                    const history = document.getElementById('history');
-                    history.innerHTML += \`<div class="msg"><b>You:</b> \${prompt}</div>\`;
-
-                    vscode.postMessage({ type: 'sendPrompt', prompt });
+                    if (!prompt || busy) return;
+                    const id = nextId++;
+                    addCard('<b>You:</b> ' + esc(prompt), 'msg user');
+                    const el = addCard('<span class="spinner">Analyzing prompt (local vs global)…</span>');
+                    turns.set(id, { el });
+                    setBusy(true);
+                    vscode.postMessage({ type: 'sendPrompt', id, prompt });
                     input.value = '';
                 }
 
-                window.addEventListener('message', event => {
-                    const message = event.data;
-                    if (message.type === 'addResponse') {
-                        const res = message.result;
-                        const isLocal = res.routing === 'LOCAL';
-                        const badgeClass = isLocal ? 'local' : 'cloud';
-                        const badgeText = isLocal ? '🟢 LOCAL INFERENCE' : '🔵 CLOUD ESCALATION';
-                        
-                        let savedText = '0%';
-                        if (res.original_tokens > 0) {
-                            const pct = Math.round((1 - (res.optimized_tokens / res.original_tokens)) * 100);
-                            savedText = \`\${pct}% (\${res.optimized_tokens} tokens sent)\`;
-                        }
+                function run(id, route) {
+                    const turn = turns.get(id);
+                    if (!turn || busy) return;
+                    const label = route === 'local' ? 'local LLM' : 'global (cloud) LLM';
+                    turn.pendingEl = addCard('<span class="spinner">Asking the ' + label + '…</span>');
+                    setBusy(true);
+                    vscode.postMessage({ type: 'run', id, req: turn.req, route });
+                }
 
-                        const history = document.getElementById('history');
-                        history.innerHTML += \`
-                            <div class="msg">
-                                <span class="badge \${badgeClass}">\${badgeText}</span>
-                                <div class="metrics">
-                                    <b>Confidence:</b> \${Math.round(res.confidence * 100)}% | 
-                                    <b>Token Savings:</b> \${savedText}
-                                </div>
-                                <p class="answer">\${res.answer}</p>
-                            </div>
-                        \`;
+                function decisionLabel(d) {
+                    return d === 'cloud' ? '🔵 Complex → global LLM recommended'
+                         : d === 'local_first' ? '🟡 Medium → local first'
+                         : '🟢 Simple → local LLM';
+                }
+
+                function renderAnalysis(id, a, contextInfo) {
+                    const turn = turns.get(id);
+                    const reasons = (a.reasons || []).map(r => '<li>' + esc(r) + '</li>').join('');
+                    const files = (a.files_selected || []).map(f => '<code>' + esc(f) + '</code>').join(', ');
+                    const isCloud = a.decision === 'cloud';
+                    turn.el.innerHTML =
+                        '<span class="badge ' + esc(a.decision) + '">' + decisionLabel(a.decision) + '</span>' +
+                        '<div class="metrics"><b>Complexity:</b> ' + esc(a.complexity_score) +
+                        ' · <b>Task:</b> ' + esc(a.task_type) +
+                        ' · <b>Optimizer:</b> ' + esc(a.context_optimizer) + '</div>' +
+                        '<div class="muted">Context: ' + esc(contextInfo) + '</div>' +
+                        '<ul>' + reasons + '</ul>' +
+                        '<div>Global would send ~<b>' + fmt(a.estimated_cloud_tokens) + '</b> tokens instead of ' +
+                        fmt(a.original_tokens) + ' for the full context' +
+                        (a.secrets_redacted ? ', with <b>' + a.secrets_redacted + '</b> secret(s) masked' : '') +
+                        '. Local sends nothing off your machine.</div>' +
+                        (files ? '<details><summary>Files the global LLM would see</summary>' + files + '</details>' : '') +
+                        '<div class="choices">' +
+                            '<button data-route="local" data-id="' + id + '" class="' + (isCloud ? 'secondary' : '') + '">🖥️ Use local LLM</button>' +
+                            '<button data-route="cloud" data-id="' + id + '" class="' + (isCloud ? '' : 'secondary') + '">☁️ Use global LLM' + (isCloud ? ' (recommended)' : '') + '</button>' +
+                        '</div>';
+                }
+
+                function renderResult(id, r) {
+                    const turn = turns.get(id);
+                    const isLocal = r.route === 'local';
+                    let metrics;
+                    if (isLocal) {
+                        metrics = '<b>Model:</b> ' + esc(r.model) + ' · <b>Confidence:</b> ' +
+                            (r.confidence == null ? 'n/a' : Math.round(r.confidence * 100) + '%') +
+                            ' · ' + fmt(r.latency_ms) + ' ms · <b>0</b> tokens sent to cloud';
+                    } else {
+                        const pct = r.original_tokens ? Math.round(100 * r.tokens_saved / r.original_tokens) : 0;
+                        metrics = '<b>Model:</b> ' + esc(r.model) + ' · ' + fmt(r.latency_ms) + ' ms<br>' +
+                            '<b>Token savings:</b> sent ' + fmt(r.sent_tokens) + ' of ' + fmt(r.original_tokens) +
+                            ' (saved ' + fmt(r.tokens_saved) + ', ' + pct + '%) · ' + r.secrets_redacted + ' secret(s) masked';
+                    }
+                    const lowConf = isLocal && r.confidence != null && r.confidence < turn.analysis.min_local_confidence;
+                    const files = (r.files_selected || []).map(f => '<code>' + esc(f) + '</code>').join(', ');
+                    const trace = (r.trace || []).map(t => '<li>' + esc(t) + '</li>').join('');
+                    turn.pendingEl.innerHTML =
+                        '<span class="badge ' + (isLocal ? 'local' : 'cloud') + '">' +
+                            (isLocal ? '🟢 Local inference' : '🔵 Global (cloud) LLM') + '</span>' +
+                        '<div class="metrics">' + metrics + '</div>' +
+                        (r.escalated ? '<div class="warn">Escalated: ' + esc(r.escalation_reason) + '</div>' : '') +
+                        (lowConf ? '<div class="warn">The local model wasn\\'t confident about this answer.</div>' : '') +
+                        '<div class="answer">' + renderMarkdown(r.answer) + '</div>' +
+                        (!isLocal && files ? '<details><summary>Context sent</summary>' + files + '</details>' : '') +
+                        (trace ? '<details><summary>Pipeline trace</summary><ul>' + trace + '</ul></details>' : '') +
+                        (isLocal ? '<div class="choices"><button data-route="cloud" data-id="' + id + '" class="' + (lowConf ? '' : 'secondary') + '">' +
+                            (lowConf ? '☁️ Retry with global LLM' : 'Not satisfied? ☁️ Use global LLM') + '</button></div>' : '');
+                    turn.pendingEl = null;
+                }
+
+                function renderStatus(m) {
+                    const el = document.getElementById('status');
+                    if (!m.online) {
+                        el.innerHTML = '<span class="offline">● Backend offline</span> (' + esc(m.apiUrl) + ')<div class="muted">' +
+                            esc(m.error) + '</div><div class="choices"><button id="retryStatus" class="secondary">Retry connection</button></div>';
+                        return;
+                    }
+                    const h = m.health, s = m.stats;
+                    el.innerHTML = '● API online · cloud: <code>' + esc(h.cloud_provider) + '</code> · local: <code>' +
+                        esc(h.local_model) + '</code> · Ollama ' + (h.ollama ? '✅' : '❌') +
+                        '<div class="stats"><span>🖥️ Local: <b>' + s.local_requests + '</b></span><span>☁️ Cloud: <b>' +
+                        s.cloud_requests + '</b></span><span>Tokens saved: <b>' + fmt(s.total_tokens_saved) + '</b> (' +
+                        s.cloud_token_reduction_pct + '%)</span></div>';
+                }
+
+                sendBtn.addEventListener('click', send);
+                input.addEventListener('keydown', e => {
+                    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
+                });
+                document.addEventListener('click', e => {
+                    const target = e.target.closest('button');
+                    if (!target) return;
+                    if (target.id === 'retryStatus') { vscode.postMessage({ type: 'refreshStatus' }); return; }
+                    if (target.dataset.route && !busy) {
+                        target.dataset.used = '1';
+                        run(Number(target.dataset.id), target.dataset.route);
                     }
                 });
+
+                window.addEventListener('message', event => {
+                    const m = event.data;
+                    const turn = turns.get(m.id);
+                    switch (m.type) {
+                        case 'status':
+                            renderStatus(m);
+                            break;
+                        case 'analysis':
+                            turn.req = m.req;
+                            turn.analysis = m.analysis;
+                            renderAnalysis(m.id, m.analysis, m.contextInfo);
+                            setBusy(false);
+                            if (m.analysis.decision !== 'cloud') {
+                                // Simple (or borderline) task: stay local automatically; the user can still go global after
+                                turn.el.querySelector('button[data-route="local"]').dataset.used = '1';
+                                run(m.id, 'local');
+                            }
+                            break;
+                        case 'result':
+                            renderResult(m.id, m.result);
+                            setBusy(false);
+                            break;
+                        case 'error': {
+                            const el = turn ? (turn.pendingEl || turn.el) : addCard('');
+                            el.innerHTML = '<div class="error">⚠️ ' + esc(m.message) + '</div>';
+                            if (turn) turn.pendingEl = null;
+                            setBusy(false);
+                            break;
+                        }
+                    }
+                });
+
+                vscode.postMessage({ type: 'ready' });
             </script>
         </body>
         </html>`;
     }
+}
+
+function getNonce(): string {
+    const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+    let nonce = '';
+    for (let i = 0; i < 32; i++) {
+        nonce += chars.charAt(Math.floor(Math.random() * chars.length));
+    }
+    return nonce;
 }
