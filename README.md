@@ -1,4 +1,4 @@
-# LocalPilot
+# LocalPilot.
 
 > **A local-first AI gateway for coding assistants.**
 >
