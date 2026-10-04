@@ -1,0 +1,12 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# Generated demo repository (run: python examples/seed_demo_repo.py)
+examples/frozen_repo/
+
+# Local env
+.env
